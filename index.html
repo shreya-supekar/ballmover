@@ -2,227 +2,169 @@
 <html>
   <head>
     <meta charset="utf-8">
-    <title>Hand-Guided Navigation - WebXR</title>
-    <meta name="description" content="VR Locomotion using Hand Proximity and a Floating Sphere">
-    <!-- A-Frame Main Library -->
+    <title>Hand-Guided Navigation - Enhanced</title>
     <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
-    <!-- Environment Component for quick scenery -->
     <script src="https://unpkg.com/aframe-environment-component@1.3.2/dist/aframe-environment-component.min.js"></script>
     
     <script>
-      /**
-       * hand-locomotion-sphere Component
-       * * Logic: 
-       * 1. Tracks the right hand index tip via the WebXR Hand Tracking API.
-       * 2. Calculates the distance between the hand and the sphere.
-       * 3. If within proximity, treats the hand offset as a 3D joystick vector.
-       * 4. Translates the camera rig based on that vector relative to head orientation.
-       * 5. Smoothly tethers the sphere to the user's chest when not in use.
-       */
-      AFRAME.registerComponent('hand-locomotion-sphere', {
+      AFRAME.registerComponent('hand-joystick', {
         schema: {
           rig: { type: 'selector', default: '#rig' },
           camera: { type: 'selector', default: '#camera' },
           hand: { type: 'selector', default: '#rightHand' },
-          speed: { type: 'number', default: 3.0 },
-          deadZone: { type: 'number', default: 0.06 },
-          hoverDistance: { type: 'number', default: 0.35 },
-          maxOffset: { type: 'number', default: 0.5 },
-          tetherSpeed: { type: 'number', default: 0.05 } // Interpolation factor
+          speed: { type: 'number', default: 4.0 },
+          deadZone: { type: 'number', default: 0.05 },
+          hoverDistance: { type: 'number', default: 0.4 },
+          maxOffset: { type: 'number', default: 0.6 }
         },
 
         init: function () {
-          this.velocity = new THREE.Vector3();
           this.handPos = new THREE.Vector3();
           this.spherePos = new THREE.Vector3();
-          this.offset = new THREE.Vector3();
-          this.direction = new THREE.Vector3();
-          this.isHovering = false;
+          this.moveVector = new THREE.Vector3();
+          this.camForward = new THREE.Vector3();
+          this.camRight = new THREE.Vector3();
           
-          // Initial relative offset from chest (0.5m forward, -0.4m down from eyes)
-          this.defaultRelativePos = new THREE.Vector3(0, -0.4, -0.5);
+          // Create a visual line to show the movement vector
+          this.line = document.createElement('a-entity');
+          this.line.setAttribute('line', {color: 'cyan', opacity: 0.7});
+          this.el.appendChild(this.line);
           
-          console.log("Hand Locomotion System Initialized. Use Right Hand.");
+          console.log("Locomotion active. Hover hand over sphere.");
         },
 
         tick: function (time, deltaTime) {
-          if (!this.data.rig || !this.data.hand || !this.data.camera) return;
+          const data = this.data;
+          if (!data.hand || !data.rig || !data.camera) return;
 
           const seconds = deltaTime / 1000;
-          const rigEl = this.data.rig;
-          const handEl = this.data.hand;
-          const cameraEl = this.data.camera;
-
-          // 1. Get World Positions
+          
+          // 1. Get Sphere World Position
           this.el.object3D.getWorldPosition(this.spherePos);
           
-          // Access hand tracking joints
-          // A-Frame hand-tracking-controls provides access to bones
-          const handMesh = handEl.getObject3D('mesh');
-          const indexTip = handEl.components['hand-tracking-controls']?.indexTip;
-
-          if (indexTip) {
-            indexTip.getWorldPosition(this.handPos);
-          } else {
-            // Fallback to hand entity position if joints aren't ready
-            handEl.object3D.getWorldPosition(this.handPos);
-          }
-
-          // 2. Proximity Check
-          const dist = this.handPos.distanceTo(this.spherePos);
+          // 2. Get Hand World Position (Try index tip, fallback to hand entity)
+          const handComponent = data.hand.components['hand-tracking-controls'];
+          let handTarget = null;
           
-          if (dist < this.data.hoverDistance) {
-            this.isHovering = true;
-            this.handleLocomotion(seconds);
-            // Visual feedback: Brighten the sphere
-            this.el.setAttribute('material', 'emissiveIntensity', 1);
-            this.el.setAttribute('scale', '1.1 1.1 1.1');
+          if (handComponent && handComponent.indexTip) {
+            handTarget = handComponent.indexTip;
           } else {
-            this.isHovering = false;
-            // Visual feedback: Dim the sphere
-            this.el.setAttribute('material', 'emissiveIntensity', 0.2);
-            this.el.setAttribute('scale', '1 1 1');
-            this.tetherToChest(seconds);
+            handTarget = data.hand.object3D;
+          }
+          handTarget.getWorldPosition(this.handPos);
+
+          // 3. Distance Calculation
+          const distance = this.handPos.distanceTo(this.spherePos);
+
+          if (distance < data.hoverDistance) {
+            // Calculate raw offset
+            this.moveVector.copy(this.handPos).sub(this.spherePos);
+            
+            // Check Deadzone
+            const magnitude = this.moveVector.length();
+            if (magnitude > data.deadZone) {
+              this.applyMovement(magnitude, seconds);
+              this.updateVisuals(true);
+            } else {
+              this.updateVisuals(false);
+            }
+          } else {
+            this.updateVisuals(false);
+            this.tetherSphere(seconds);
           }
         },
 
-        handleLocomotion: function(seconds) {
-          // Calculate vector from sphere center to hand
-          this.offset.copy(this.handPos).sub(this.spherePos);
+        applyMovement: function(magnitude, seconds) {
+          const data = this.data;
           
-          // Deadzone check
-          const length = this.offset.length();
-          if (length < this.data.deadZone) return;
+          // Get Camera orientation
+          const cameraObj = data.camera.object3D;
+          cameraObj.getWorldDirection(this.camForward);
+          this.camForward.y = 0; // Keep movement horizontal
+          this.camForward.normalize();
+          
+          this.camRight.crossVectors(this.camForward, new THREE.Vector3(0, 1, 0)).normalize();
 
-          // Clamp max speed
-          const clampedLength = Math.min(length, this.data.maxOffset);
-          
-          // Normalize offset to get direction, then scale by clamped speed
-          this.direction.copy(this.offset).normalize();
-          
-          // Project movement onto the horizontal plane (X, Z)
-          // We use the camera's Y-rotation so "forward" is where user looks
-          const rotation = this.data.camera.object3D.rotation.y;
-          
-          // Map local hand offset to world movement
-          // If hand is 'forward' of sphere, move in direction of gaze
-          const moveX = (this.offset.x * Math.cos(rotation) + this.offset.z * Math.sin(rotation));
-          const moveZ = (this.offset.z * Math.cos(rotation) - this.offset.x * Math.sin(rotation));
+          // Calculate movement based on hand offset relative to sphere center
+          // Offset Z is forward/back, Offset X is left/right
+          const forwardAmount = -this.moveVector.z * data.speed * seconds;
+          const rightAmount = this.moveVector.x * data.speed * seconds;
 
-          // Apply translation to rig
-          const currentPos = this.data.rig.getAttribute('position');
-          this.data.rig.setAttribute('position', {
-            x: currentPos.x + (moveX * this.data.speed * seconds),
-            y: currentPos.y, // Maintain ground height
-            z: currentPos.z + (moveZ * this.data.speed * seconds)
+          const rigPos = data.rig.getAttribute('position');
+          
+          // Update Rig Position
+          data.rig.setAttribute('position', {
+            x: rigPos.x + (this.camForward.x * forwardAmount) + (this.camRight.x * rightAmount),
+            y: rigPos.y,
+            z: rigPos.z + (this.camForward.z * forwardAmount) + (this.camRight.z * rightAmount)
           });
         },
 
-        tetherToChest: function(seconds) {
-          // Calculate where the sphere "should" be relative to the camera
-          const camObj = this.data.camera.object3D;
-          const targetWorldPos = new THREE.Vector3().copy(this.defaultRelativePos);
-          
-          // Apply camera rotation so it stays in front of chest
-          targetWorldPos.applyQuaternion(camObj.quaternion);
-          // Add camera world position
-          targetWorldPos.add(camObj.getWorldPosition(new THREE.Vector3()));
-          
-          // Smoothly move the sphere entity towards this target
-          // We move the object3D directly for smoothness
-          this.el.object3D.position.lerp(this.el.sceneEl.object3D.worldToLocal(targetWorldPos), this.data.tetherSpeed);
-        }
-      });
+        updateVisuals: function(active) {
+          if (active) {
+            this.el.setAttribute('material', 'emissiveIntensity', 1.5);
+            this.el.setAttribute('scale', '1.2 1.2 1.2');
+            // Draw line from center to hand
+            const localHand = this.el.object3D.worldToLocal(this.handPos.clone());
+            this.line.setAttribute('line', {start: {x:0, y:0, z:0}, end: localHand});
+            this.line.setAttribute('visible', true);
+          } else {
+            this.el.setAttribute('material', 'emissiveIntensity', 0.3);
+            this.el.setAttribute('scale', '1 1 1');
+            this.line.setAttribute('visible', false);
+          }
+        },
 
-      // Simple rotation component for environment landmarks
-      AFRAME.registerComponent('rotate-slowly', {
-        tick: function(t, dt) {
-          this.el.object3D.rotation.y += 0.001 * dt;
+        tetherSphere: function(seconds) {
+          // Smoothly return sphere to chest-level position in front of user
+          const camObj = this.data.camera.object3D;
+          const targetPos = new THREE.Vector3(0, -0.4, -0.5); // Local offset from head
+          targetPos.applyQuaternion(camObj.quaternion);
+          targetPos.add(camObj.getWorldPosition(new THREE.Vector3()));
+          
+          const sphereWorld = this.el.object3D.parent.worldToLocal(targetPos);
+          this.el.object3D.position.lerp(sphereWorld, 0.05);
         }
       });
     </script>
   </head>
   <body>
-    <a-scene 
-      webxr="optionalFeatures: hand-tracking" 
-      renderer="antialias: true; colorManagement: true;"
-      bloom="threshold: 0.5; strength: 1.0;">
-      
-      <!-- Assets -->
+    <a-scene webxr="optionalFeatures: hand-tracking">
       <a-assets>
-        <a-mixin id="landmark" geometry="primitive: torusKnot; radius: 0.5; radiusTubular: 0.05" material="color: #4CC3D9; wireframe: false" rotate-slowly></a-mixin>
+        <a-mixin id="tower" geometry="primitive: cylinder; radius: 0.3; height: 10" material="color: #333"></a-mixin>
       </a-assets>
 
-      <!-- Camera Rig -->
       <a-entity id="rig" position="0 0 0">
         <a-entity id="camera" camera look-controls position="0 1.6 0"></a-entity>
-        
-        <!-- Hands -->
-        <a-entity id="leftHand" hand-tracking-controls="hand: left;"></a-entity>
-        <a-entity id="rightHand" hand-tracking-controls="hand: right;"></a-entity>
+        <a-entity id="leftHand" hand-tracking-controls="hand: left"></a-entity>
+        <a-entity id="rightHand" hand-tracking-controls="hand: right"></a-entity>
 
-        <!-- Navigation Sphere (Joystick) -->
-        <!-- Starts at chest height (~1.2m) and 0.5m forward -->
-        <a-entity id="nav-sphere" 
-                  geometry="primitive: sphere; radius: 0.15" 
-                  material="color: #00ffff; transparent: true; opacity: 0.4; emissive: #00ffff; emissiveIntensity: 0.2"
+        <!-- The Control Sphere -->
+        <a-entity id="control-sphere"
+                  geometry="primitive: sphere; radius: 0.15"
+                  material="color: #00ff88; transparent: true; opacity: 0.6; emissive: #00ff88; emissiveIntensity: 0.3"
                   position="0 1.2 -0.5"
-                  hand-locomotion-sphere="rig: #rig; camera: #camera; hand: #rightHand">
-          
-          <!-- Visual Decoration for the sphere -->
-          <a-entity geometry="primitive: sphere; radius: 0.16" 
-                    material="wireframe: true; color: #ffffff; opacity: 0.2"></a-entity>
-          
-          <!-- Instructions attached to the sphere -->
-          <a-text value="HOVER RIGHT HAND TO MOVE" 
-                  position="0 0.25 0" 
-                  align="center" 
-                  width="1.5" 
-                  color="#ffffff"
-                  animation="property: opacity; from: 1; to: 0.2; dur: 2000; dir: alternate; loop: true"></a-text>
+                  hand-joystick="rig: #rig; camera: #camera; hand: #rightHand; speed: 5">
+          <a-entity geometry="primitive: sphere; radius: 0.16" material="wireframe: true; color: white"></a-entity>
         </a-entity>
       </a-entity>
 
-      <!-- Environment -->
-      <a-entity environment="preset: starry; ground: canyon; groundColor: #111; grid: dashed; gridColor: #222"></a-entity>
-
-      <!-- Movement Indicators / Landmarks -->
-      <a-entity position="-10 0 -10" mixin="landmark" material="color: #EF2D5E"></a-entity>
-      <a-entity position="10 0 -15" mixin="landmark" material="color: #FFC65D" geometry="primitive: box; height: 10; width: 0.5; depth: 0.5"></a-entity>
-      <a-entity position="-5 0 10" mixin="landmark" material="color: #7BC8A4" geometry="primitive: octahedron"></a-entity>
-      <a-entity position="15 0 5" mixin="landmark" material="color: #9370DB"></a-entity>
+      <!-- Environment with landmarks -->
+      <a-entity environment="preset: osiris; grid: cross; gridColor: #00ff88"></a-entity>
       
-      <!-- Floating 'Dust' Particles for speed reference -->
-      <a-entity position="0 5 0">
-        <!-- We use simple spheres as particles distributed in space -->
-        <a-entity geometry="primitive: sphere; radius: 0.02" material="color: #fff; shader: flat" position="2 1 -4"></a-entity>
-        <a-entity geometry="primitive: sphere; radius: 0.02" material="color: #fff; shader: flat" position="-3 2 -8"></a-entity>
-        <a-entity geometry="primitive: sphere; radius: 0.02" material="color: #fff; shader: flat" position="5 -1 -2"></a-entity>
-        <a-entity geometry="primitive: sphere; radius: 0.02" material="color: #fff; shader: flat" position="-1 4 -12"></a-entity>
-        <a-entity geometry="primitive: sphere; radius: 0.02" material="color: #fff; shader: flat" position="8 2 -6"></a-entity>
-        <a-entity geometry="primitive: sphere; radius: 0.02" material="color: #fff; shader: flat" position="-6 0 -3"></a-entity>
+      <!-- Visual movement guides -->
+      <a-entity position="-10 5 -10" mixin="tower"></a-entity>
+      <a-entity position="10 5 -10" mixin="tower"></a-entity>
+      <a-entity position="0 5 -20" mixin="tower" material="color: #ff00ff"></a-entity>
+      
+      <!-- Moving Particles for Speed Feel -->
+      <a-entity position="0 2 -5" animation="property: rotation; to: 0 360 0; dur: 20000; loop: true; easing: linear">
+        <a-sphere position="5 0 0" radius="0.1" color="yellow"></a-sphere>
+        <a-sphere position="-5 1 2" radius="0.1" color="cyan"></a-sphere>
+        <a-sphere position="2 2 -4" radius="0.1" color="magenta"></a-sphere>
       </a-entity>
 
-      <!-- Floor Grid Details -->
-      <a-grid position="0 0.01 0" rotation="-90 0 0" width="100" height="100" static-body material="transparent: true; opacity: 0.2; color: #00ffff"></a-grid>
-
-      <!-- Lights -->
-      <a-light type="ambient" color="#444"></a-light>
-      <a-light type="point" intensity="1" position="2 4 4"></a-light>
-
+      <a-text value="Hatho ka prayog karke chalo" position="0 2.5 -2" align="center" color="#00ff88"></a-text>
     </a-scene>
-
-    <!-- Fallback Message -->
-    <div id="fallback" style="position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); color: white; padding: 10px; border-radius: 5px; font-family: sans-serif; display: none; text-align: center;">
-      Hand tracking not detected. Use a VR headset like Meta Quest 2/3 with Hand Tracking enabled.
-    </div>
-
-    <script>
-      // Detection for non-VR users
-      if (!navigator.xr) {
-        document.getElementById('fallback').style.display = 'block';
-        document.getElementById('fallback').innerText = "WebXR not supported in this browser.";
-      }
-    </script>
   </body>
 </html>
