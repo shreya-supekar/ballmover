@@ -2,169 +2,224 @@
 <html>
   <head>
     <meta charset="utf-8">
-    <title>Hand-Guided Navigation - Enhanced</title>
-    <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
-    <script src="https://unpkg.com/aframe-environment-component@1.3.2/dist/aframe-environment-component.min.js"></script>
-    
+    <title>WebXR Finger Walking Locomotion</title>
+    <meta name="description" content="Finger-walking locomotion for WebXR Hand Tracking in A-Frame">
+    <!-- A-Frame 1.6.0 is required for stable hand tracking features -->
+    <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
     <script>
-      AFRAME.registerComponent('hand-joystick', {
+      /**
+       * Finger Walking Locomotion Component
+       * * Usage:
+       * Attach to the camera-rig entity.
+       * Ensure hand-tracking-controls are present on child entities.
+       */
+      AFRAME.registerComponent('finger-walking', {
         schema: {
-          rig: { type: 'selector', default: '#rig' },
-          camera: { type: 'selector', default: '#camera' },
-          hand: { type: 'selector', default: '#rightHand' },
-          speed: { type: 'number', default: 4.0 },
-          deadZone: { type: 'number', default: 0.05 },
-          hoverDistance: { type: 'number', default: 0.4 },
-          maxOffset: { type: 'number', default: 0.6 }
+          maxSpeed: { type: 'number', default: 2.0 },      // Meters per second at max frequency
+          speedFactor: { type: 'number', default: 1.0 },   // Multiplier for speed mapping
+          frequencyWindow: { type: 'number', default: 1.5 }, // Seconds to look back for steps
+          stepThreshold: { type: 'number', default: 0.055 }, // Distance (m) between palm and tip to count a "tap"
+          stepCooldown: { type: 'number', default: 200 },  // ms between steps per finger
+          directionSource: { type: 'string', default: 'head', oneOf: ['head', 'hand'] },
+          activationRequired: { type: 'boolean', default: false },
+          debug: { type: 'boolean', default: false }
         },
 
         init: function () {
-          this.handPos = new THREE.Vector3();
-          this.spherePos = new THREE.Vector3();
-          this.moveVector = new THREE.Vector3();
-          this.camForward = new THREE.Vector3();
-          this.camRight = new THREE.Vector3();
-          
-          // Create a visual line to show the movement vector
-          this.line = document.createElement('a-entity');
-          this.line.setAttribute('line', {color: 'cyan', opacity: 0.7});
-          this.el.appendChild(this.line);
-          
-          console.log("Locomotion active. Hover hand over sphere.");
-        },
+          // Internal state for tracking "steps"
+          // Structure: { left: { index: { lastDist: 0, lastStepTime: 0 }, middle: { ... } }, right: { ... } }
+          this.handState = {
+            left: this.createHandState(),
+            right: this.createHandState()
+          };
 
-        tick: function (time, deltaTime) {
-          const data = this.data;
-          if (!data.hand || !data.rig || !data.camera) return;
-
-          const seconds = deltaTime / 1000;
+          this.stepLog = []; // Array of timestamps: [ { time, hand } ]
+          this.currentSpeed = 0;
           
-          // 1. Get Sphere World Position
-          this.el.object3D.getWorldPosition(this.spherePos);
-          
-          // 2. Get Hand World Position (Try index tip, fallback to hand entity)
-          const handComponent = data.hand.components['hand-tracking-controls'];
-          let handTarget = null;
-          
-          if (handComponent && handComponent.indexTip) {
-            handTarget = handComponent.indexTip;
-          } else {
-            handTarget = data.hand.object3D;
-          }
-          handTarget.getWorldPosition(this.handPos);
+          // Reusable vectors to avoid GC
+          this.targetVelocity = new THREE.Vector3();
+          this.directionVec = new THREE.Vector3();
+          this.palmPos = new THREE.Vector3();
+          this.tipPos = new THREE.Vector3();
+          this.rigQuaternion = new THREE.Quaternion();
 
-          // 3. Distance Calculation
-          const distance = this.handPos.distanceTo(this.spherePos);
+          // References to hand entities
+          this.hands = {
+            left: document.querySelector('#leftHand'),
+            right: document.querySelector('#rightHand')
+          };
+          this.cameraEl = document.querySelector('a-camera');
 
-          if (distance < data.hoverDistance) {
-            // Calculate raw offset
-            this.moveVector.copy(this.handPos).sub(this.spherePos);
-            
-            // Check Deadzone
-            const magnitude = this.moveVector.length();
-            if (magnitude > data.deadZone) {
-              this.applyMovement(magnitude, seconds);
-              this.updateVisuals(true);
-            } else {
-              this.updateVisuals(false);
-            }
-          } else {
-            this.updateVisuals(false);
-            this.tetherSphere(seconds);
+          if (this.data.debug) {
+            this.createDebugUI();
           }
         },
 
-        applyMovement: function(magnitude, seconds) {
-          const data = this.data;
-          
-          // Get Camera orientation
-          const cameraObj = data.camera.object3D;
-          cameraObj.getWorldDirection(this.camForward);
-          this.camForward.y = 0; // Keep movement horizontal
-          this.camForward.normalize();
-          
-          this.camRight.crossVectors(this.camForward, new THREE.Vector3(0, 1, 0)).normalize();
+        createHandState: function() {
+          return {
+            index: { isDown: false, lastStepTime: 0 },
+            middle: { isDown: false, lastStepTime: 0 },
+            active: false
+          };
+        },
 
-          // Calculate movement based on hand offset relative to sphere center
-          // Offset Z is forward/back, Offset X is left/right
-          const forwardAmount = -this.moveVector.z * data.speed * seconds;
-          const rightAmount = this.moveVector.x * data.speed * seconds;
+        createDebugUI: function() {
+          this.debugText = document.createElement('a-text');
+          this.debugText.setAttribute('value', 'Steps: 0\nFreq: 0\nSpeed: 0');
+          this.debugText.setAttribute('position', '0 1.5 -1.5');
+          this.debugText.setAttribute('align', 'center');
+          this.debugText.setAttribute('color', '#00FF00');
+          this.cameraEl.appendChild(this.debugText);
+        },
 
-          const rigPos = data.rig.getAttribute('position');
-          
-          // Update Rig Position
-          data.rig.setAttribute('position', {
-            x: rigPos.x + (this.camForward.x * forwardAmount) + (this.camRight.x * rightAmount),
-            y: rigPos.y,
-            z: rigPos.z + (this.camForward.z * forwardAmount) + (this.camRight.z * rightAmount)
+        tick: function (time, delta) {
+          if (delta > 200) return; // Ignore large frame jumps
+
+          let totalStepsInWindow = 0;
+          const now = performance.now();
+
+          // 1. Detect steps from both hands
+          ['left', 'right'].forEach(side => {
+            this.processHand(side, now);
           });
-        },
 
-        updateVisuals: function(active) {
-          if (active) {
-            this.el.setAttribute('material', 'emissiveIntensity', 1.5);
-            this.el.setAttribute('scale', '1.2 1.2 1.2');
-            // Draw line from center to hand
-            const localHand = this.el.object3D.worldToLocal(this.handPos.clone());
-            this.line.setAttribute('line', {start: {x:0, y:0, z:0}, end: localHand});
-            this.line.setAttribute('visible', true);
-          } else {
-            this.el.setAttribute('material', 'emissiveIntensity', 0.3);
-            this.el.setAttribute('scale', '1 1 1');
-            this.line.setAttribute('visible', false);
+          // 2. Filter the step log for the rolling window
+          const windowMs = this.data.frequencyWindow * 1000;
+          this.stepLog = this.stepLog.filter(step => (now - step.time) < windowMs);
+
+          // 3. Calculate Frequency and Speed
+          // 4 steps per second (2 per finger) is roughly a fast walk
+          const frequency = this.stepLog.length / this.data.frequencyWindow;
+          
+          // Map frequency to speed (Linear with a slight ease-in)
+          // 0 to 4 freq maps to 0 to maxSpeed
+          const targetSpeed = Math.min(this.data.maxSpeed, (frequency / 4) * this.data.maxSpeed * this.data.speedFactor);
+          
+          // Smooth the speed transition
+          this.currentSpeed = THREE.MathUtils.lerp(this.currentSpeed, targetSpeed, 0.1);
+
+          // 4. Apply Movement
+          if (this.currentSpeed > 0.01) {
+            this.applyMovement(delta / 1000);
+          }
+
+          if (this.data.debug && this.debugText) {
+            this.debugText.setAttribute('value', 
+              `Steps in Window: ${this.stepLog.length}\nFreq: ${frequency.toFixed(2)} Hz\nSpeed: ${this.currentSpeed.toFixed(2)} m/s`
+            );
           }
         },
 
-        tetherSphere: function(seconds) {
-          // Smoothly return sphere to chest-level position in front of user
-          const camObj = this.data.camera.object3D;
-          const targetPos = new THREE.Vector3(0, -0.4, -0.5); // Local offset from head
-          targetPos.applyQuaternion(camObj.quaternion);
-          targetPos.add(camObj.getWorldPosition(new THREE.Vector3()));
+        processHand: function(side, now) {
+          const handEntity = this.hands[side];
+          if (!handEntity) return;
+
+          const hb = handEntity.components['hand-tracking-controls'];
+          if (!hb || !hb.mesh) return;
+
+          // In A-Frame 1.6.0+, joint data is accessed via the mesh/bones or the API
+          // We'll use the tracked-controls-webxr data if available
+          const controller = handEntity.components['tracked-controls-webxr']?.controller;
+          if (!controller || !controller.hand) return;
+
+          const palmJoint = controller.hand.get('palm');
+          const indexJoint = controller.hand.get('index-finger-tip');
+          const middleJoint = controller.hand.get('middle-finger-tip');
+
+          if (!palmJoint || !indexJoint || !middleJoint) return;
+
+          // Check for activation (e.g. palm facing up)
+          if (this.data.activationRequired) {
+             // Basic activation: check if palm normal is pointing roughly towards user/up
+             // We'll skip for this implementation to keep it "walk-ready"
+          }
+
+          this.checkFingerStep(side, 'index', palmJoint, indexJoint, now);
+          this.checkFingerStep(side, 'middle', palmJoint, middleJoint, now);
+        },
+
+        checkFingerStep: function(side, finger, palm, tip, now) {
+          const state = this.handState[side][finger];
           
-          const sphereWorld = this.el.object3D.parent.worldToLocal(targetPos);
-          this.el.object3D.position.lerp(sphereWorld, 0.05);
+          // Get Euclidean distance between palm and tip
+          const dx = palm.transform.position.x - tip.transform.position.x;
+          const dy = palm.transform.position.y - tip.transform.position.y;
+          const dz = palm.transform.position.z - tip.transform.position.z;
+          const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+          // Step Detection Logic (Palm-relative distance)
+          // When distance is low, the finger is "touching" the palm
+          if (!state.isDown && dist < this.data.stepThreshold) {
+            if (now - state.lastStepTime > this.data.stepCooldown) {
+              state.isDown = true;
+              state.lastStepTime = now;
+              this.stepLog.push({ time: now, hand: side });
+            }
+          } else if (state.isDown && dist > this.data.stepThreshold + 0.01) {
+            // Threshold buffer (+0.01) to prevent flickering
+            state.isDown = false;
+          }
+        },
+
+        applyMovement: function(dt) {
+          this.directionVec.set(0, 0, 0);
+
+          if (this.data.directionSource === 'head') {
+            // Get camera forward vector (projected on XZ)
+            this.cameraEl.object3D.getWorldDirection(this.directionVec);
+            this.directionVec.negate(); // Vector points backwards by default in THREE
+          } else {
+            // Use the most active hand's direction
+            // For simplicity, we default to the left hand's forward if available
+            const handObj = this.hands.left.object3D;
+            handObj.getWorldDirection(this.directionVec);
+            this.directionVec.negate();
+          }
+
+          // Force XZ plane only
+          this.directionVec.y = 0;
+          this.directionVec.normalize();
+
+          // Calculate displacement
+          const distance = this.currentSpeed * dt;
+          this.el.object3D.position.addScaledVector(this.directionVec, distance);
         }
       });
     </script>
   </head>
   <body>
-    <a-scene webxr="optionalFeatures: hand-tracking">
-      <a-assets>
-        <a-mixin id="tower" geometry="primitive: cylinder; radius: 0.3; height: 10" material="color: #333"></a-mixin>
-      </a-assets>
+    <a-scene 
+      xr-mode-ui="enabled: true" 
+      renderer="antialias: true"
+      webxr="optionalFeatures: hand-tracking">
+      
+      <!-- Environment -->
+      <a-sky color="#222"></a-sky>
+      <a-plane position="0 0 0" rotation="-90 0 0" width="100" height="100" color="#444" 
+               material="roughness: 1; src: https://cdn.aframe.io/a-painter/images/floor.jpg; repeat: 50 50">
+      </a-plane>
 
-      <a-entity id="rig" position="0 0 0">
-        <a-entity id="camera" camera look-controls position="0 1.6 0"></a-entity>
-        <a-entity id="leftHand" hand-tracking-controls="hand: left"></a-entity>
-        <a-entity id="rightHand" hand-tracking-controls="hand: right"></a-entity>
+      <!-- Visual Reference Poles -->
+      <a-box position="-5 1 -5" color="red"></a-box>
+      <a-box position="5 1 -5" color="blue"></a-box>
+      <a-box position="0 1 -10" color="green"></a-box>
 
-        <!-- The Control Sphere -->
-        <a-entity id="control-sphere"
-                  geometry="primitive: sphere; radius: 0.15"
-                  material="color: #00ff88; transparent: true; opacity: 0.6; emissive: #00ff88; emissiveIntensity: 0.3"
-                  position="0 1.2 -0.5"
-                  hand-joystick="rig: #rig; camera: #camera; hand: #rightHand; speed: 5">
-          <a-entity geometry="primitive: sphere; radius: 0.16" material="wireframe: true; color: white"></a-entity>
-        </a-entity>
+      <!-- Camera Rig -->
+      <a-entity id="rig" position="0 0 0" finger-walking="debug: true; maxSpeed: 2.5; directionSource: head">
+        <a-camera position="0 1.6 0" look-controls="pointerLockEnabled: true"></a-camera>
+        
+        <!-- Hand Tracking Entities -->
+        <a-entity id="leftHand" hand-tracking-controls="hand: left;"></a-entity>
+        <a-entity id="rightHand" hand-tracking-controls="hand: right;"></a-entity>
       </a-entity>
 
-      <!-- Environment with landmarks -->
-      <a-entity environment="preset: osiris; grid: cross; gridColor: #00ff88"></a-entity>
-      
-      <!-- Visual movement guides -->
-      <a-entity position="-10 5 -10" mixin="tower"></a-entity>
-      <a-entity position="10 5 -10" mixin="tower"></a-entity>
-      <a-entity position="0 5 -20" mixin="tower" material="color: #ff00ff"></a-entity>
-      
-      <!-- Moving Particles for Speed Feel -->
-      <a-entity position="0 2 -5" animation="property: rotation; to: 0 360 0; dur: 20000; loop: true; easing: linear">
-        <a-sphere position="5 0 0" radius="0.1" color="yellow"></a-sphere>
-        <a-sphere position="-5 1 2" radius="0.1" color="cyan"></a-sphere>
-        <a-sphere position="2 2 -4" radius="0.1" color="magenta"></a-sphere>
+      <!-- UI Instructions -->
+      <a-entity position="0 2 -2">
+        <a-text value="FINGER WALKING VR" align="center" width="4"></a-text>
+        <a-text value="In VR: Use your index and middle fingers to 'walk' against your palm." 
+                position="0 -0.3 0" align="center" width="3" color="#CCC"></a-text>
       </a-entity>
 
-      <a-text value="Hatho ka prayog karke chalo" position="0 2.5 -2" align="center" color="#00ff88"></a-text>
     </a-scene>
   </body>
 </html>
